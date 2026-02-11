@@ -1,0 +1,7 @@
+[
+  {"id":"math_001","type":"exact","prompt":"Answer with only the number.\n2 + 2 =","expected":"4"},
+  {"id":"math_002","type":"exact","prompt":"Answer with only the number.\n19 - 7 =","expected":"12"},
+  {"id":"math_003","type":"exact","prompt":"Answer with only the number.\n12 * 3 =","expected":"36"},
+  {"id":"choice_001","type":"choice","prompt":"Answer with only A, B, C, or D.\nWhich is a mammal?\nA) Shark\nB) Dolphin\nC) Salmon\nD) Trout","expected":"B"},
+  {"id":"json_001","type":"exact_json","prompt":"Return valid JSON only.\n{\"answer\": 2+3}","expected":"{\"answer\": 5}"}
+]
