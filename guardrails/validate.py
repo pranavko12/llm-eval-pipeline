@@ -5,7 +5,6 @@ import json
 import os
 import random
 import re
-import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -48,6 +47,8 @@ def normalize_text(s: str, mode: str) -> str:
         return s.strip()
     if mode == "collapse_ws":
         return re.sub(r"\s+", " ", s.strip())
+    if mode == "lower_strip":
+        return s.strip().lower()
     if mode == "json_canonical":
         try:
             obj = json.loads(s)
@@ -57,11 +58,43 @@ def normalize_text(s: str, mode: str) -> str:
     return s.strip()
 
 
+def default_prompts_for_validator(v: str) -> List[Tuple[str, str]]:
+    if v == "single_letter_abcd":
+        return [
+            ("p0", "Return exactly one character: A, B, C, or D. No punctuation. Which is a mammal? A shark B dolphin C trout D tuna"),
+            ("p1", "Return exactly one character: A, B, C, or D. No punctuation. Which is a planet? A Mars B Whale C Carrot D Guitar"),
+            ("p2", "Return exactly one character: A, B, C, or D. No punctuation. Which is a programming language? A Python B Banana C Chair D River"),
+        ]
+    if v == "yes_no":
+        return [
+            ("p0", "Return exactly one word: yes or no. No punctuation. Is water wet"),
+            ("p1", "Return exactly one word: yes or no. No punctuation. Is 2 greater than 5"),
+            ("p2", "Return exactly one word: yes or no. No punctuation. Is the sky blue on a clear day"),
+        ]
+    if v == "number":
+        return [
+            ("p0", "Return exactly the number only. No words. 17 + 25"),
+            ("p1", "Return exactly the number only. No words. 144 / 12"),
+            ("p2", "Return exactly the number only. No words. 9 * 8"),
+        ]
+    if v == "json":
+        return [
+            ("p0", 'Return only valid JSON with keys "answer" and "confidence". answer is a short string. confidence is a number from 0 to 1. Question: What is the capital of Japan'),
+            ("p1", 'Return only valid JSON with keys "answer" and "confidence". answer is a short string. confidence is a number from 0 to 1. Question: 17 + 25'),
+            ("p2", 'Return only valid JSON with keys "answer" and "confidence". answer is a short string. confidence is a number from 0 to 1. Question: Is water wet'),
+        ]
+    return [
+        ("p0", "Return exactly one word. What is the capital of Japan"),
+        ("p1", "Return exactly one word. What is photosynthesis"),
+        ("p2", "Return exactly one word. What is gravity"),
+    ]
+
+
 def load_prompts(args: argparse.Namespace) -> List[Tuple[str, str]]:
     prompts: List[Tuple[str, str]] = []
 
     if args.prompt:
-        prompts.append(("p0", args.prompt))
+        return [("p0", args.prompt)]
 
     if args.prompts_file:
         with open(args.prompts_file, "r", encoding="utf-8") as f:
@@ -80,47 +113,33 @@ def load_prompts(args: argparse.Namespace) -> List[Tuple[str, str]]:
             for i, ln in enumerate(lines):
                 prompts.append((f"p{i}", ln))
 
-    if not prompts:
-        prompts = [
-            ("p0", "Return only A, B, C, or D. Which is a mammal. A shark B dolphin C trout D tuna"),
-            ("p1", "Return only yes or no. Is water wet"),
-            ("p2", "Return only the number. 17 + 25"),
-        ]
+    if prompts:
+        return prompts
 
-    return prompts
+    return default_prompts_for_validator(args.validator)
 
 
-def builtin_validator(name: str):
+def builtin_validator(name: str) -> Tuple[str, Optional[str], Optional[List[str]]]:
     if name == "none":
-        return ("none", None, None)
-
+        return "none", None, None
     if name == "single_letter_abcd":
-        return ("regex", r"^\s*[ABCD]\s*$", None)
-
+        return "regex", r"^\s*[ABCD]\s*$", None
     if name == "yes_no":
-        return ("regex", r"^\s*(yes|no)\s*$", None)
-
+        return "regex", r"^\s*(yes|no)\s*$", None
     if name == "number":
-        return ("regex", r"^\s*-?\d+(\.\d+)?\s*$", None)
-
+        return "regex", r"^\s*-?\d+(\.\d+)?\s*$", None
     if name == "json":
-        return ("json_keys", None, ["answer"])
+        return "json_keys", None, ["answer", "confidence"]
+    return "none", None, None
 
-    return ("none", None, None)
 
-
-def validate_output(
-    text: str,
-    vmode: str,
-    pattern: Optional[str],
-    required_keys: Optional[List[str]],
-) -> Tuple[bool, str]:
+def validate_output(text: str, vmode: str, pattern: Optional[str], required_keys: Optional[List[str]]) -> Tuple[bool, str]:
     if vmode == "none":
         return True, "ok"
 
     if vmode == "regex":
         if not pattern:
-            return False, "missing pattern"
+            return False, "missing_pattern"
         try:
             ok = re.match(pattern, text) is not None
             return ok, "ok" if ok else "regex_mismatch"
@@ -143,12 +162,38 @@ def validate_output(
     return False, "unknown_validator_mode"
 
 
-async def ollama_stream(
-    session: aiohttp.ClientSession,
-    url: str,
-    payload: Dict[str, Any],
-    timeout_s: float,
-) -> Tuple[int, float, float, str, str]:
+def decode_stop_list(s: str) -> List[str]:
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    out: List[str] = []
+    for p in parts:
+        out.append(p.encode("utf-8").decode("unicode_escape"))
+    return out
+
+
+def build_payload(
+    model: str,
+    prompt: str,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    max_tokens: int,
+    seed: Optional[int],
+    stop: Optional[List[str]],
+) -> Dict[str, Any]:
+    opts: Dict[str, Any] = {
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "top_k": int(top_k),
+        "num_predict": int(max_tokens),
+    }
+    if seed is not None:
+        opts["seed"] = int(seed)
+    if stop:
+        opts["stop"] = stop
+    return {"model": model, "prompt": prompt, "stream": True, "options": opts}
+
+
+async def ollama_stream(session: aiohttp.ClientSession, url: str, payload: Dict[str, Any], timeout_s: float) -> Tuple[int, float, float, str, str]:
     t0 = now()
     ttft: Optional[float] = None
     out_parts: List[str] = []
@@ -179,51 +224,13 @@ async def ollama_stream(
                     if obj.get("done") is True:
                         break
             latency = now() - t0
-            text = "".join(out_parts)
-            return http_status, (ttft if ttft is not None else -1.0), latency, text, ""
+            return http_status, (ttft if ttft is not None else -1.0), latency, "".join(out_parts), ""
     except Exception as e:
         latency = now() - t0
         return http_status, -1.0, latency, "", str(e)
 
 
-def build_payload(
-    model: str,
-    prompt: str,
-    temperature: float,
-    top_p: float,
-    top_k: int,
-    max_tokens: int,
-    seed: Optional[int],
-    stop: Optional[List[str]],
-) -> Dict[str, Any]:
-    opts: Dict[str, Any] = {
-        "temperature": float(temperature),
-        "top_p": float(top_p),
-        "top_k": int(top_k),
-        "num_predict": int(max_tokens),
-    }
-    if seed is not None:
-        opts["seed"] = int(seed)
-    if stop:
-        opts["stop"] = stop
-
-    return {
-        "model": model,
-        "prompt": prompt,
-        "stream": True,
-        "options": opts,
-    }
-
-
-def decode_stop_list(s: str) -> List[str]:
-    parts = [p.strip() for p in s.split(",") if p.strip()]
-    out: List[str] = []
-    for p in parts:
-        out.append(p.encode("utf-8").decode("unicode_escape"))
-    return out
-
-
-async def run_determinism_checks(args: argparse.Namespace) -> int:
+async def run_checks(args: argparse.Namespace) -> int:
     prompts = load_prompts(args)
 
     if args.validator in ["none", "single_letter_abcd", "yes_no", "number", "json"]:
@@ -258,18 +265,14 @@ async def run_determinism_checks(args: argparse.Namespace) -> int:
                     seed=seed,
                     stop=stop_list,
                 )
+
                 run_id = f"{pid}-r{r}-s{seed}"
-                http_status, ttft_s, latency_s, text, err = await ollama_stream(
-                    session=session,
-                    url=args.url,
-                    payload=payload,
-                    timeout_s=args.timeout,
-                )
+                http_status, ttft_s, latency_s, text, err = await ollama_stream(session, args.url, payload, args.timeout)
 
                 norm = normalize_text(text, args.normalize)
                 h = sha256_text(norm)
 
-                ok_http = (http_status and http_status < 400 and not err)
+                ok_http = http_status and http_status < 400 and not err
                 ok_valid, valid_msg = validate_output(text, vmode, pattern, required_keys)
 
                 if not ok_http:
@@ -292,44 +295,29 @@ async def run_determinism_checks(args: argparse.Namespace) -> int:
                 )
 
     by_prompt: Dict[str, List[RunResult]] = {}
-    for r in results:
-        by_prompt.setdefault(r.prompt_id, []).append(r)
+    for rr in results:
+        by_prompt.setdefault(rr.prompt_id, []).append(rr)
 
     for pid, runs in by_prompt.items():
-        hashes = [x.output_sha256 for x in runs]
-        uniq = sorted(set(hashes))
+        uniq = sorted(set(x.output_sha256 for x in runs))
         if len(uniq) != 1:
             failures.append(f"{pid} nondeterministic_outputs unique_hashes {len(uniq)}")
-            if args.print_diffs:
-                idx: Dict[str, List[int]] = {}
-                for i, h in enumerate(hashes):
-                    idx.setdefault(h, []).append(i)
-                chosen = list(idx.keys())
-                a = runs[idx[chosen[0]][0]].output
-                b = runs[idx[chosen[1]][0]].output
-                print("\nPrompt id", pid)
-                print("Example output A")
-                print(a)
-                print("\nExample output B")
-                print(b)
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
         f.write("run_id,prompt_id,output_sha256,http_status,ttft_s,latency_s,ok,validation\n")
-        for r in results:
-            ok_http = (r.http_status and r.http_status < 400 and not r.error)
-            ok_valid, valid_msg = validate_output(r.output, vmode, pattern, required_keys)
+        for rr in results:
+            ok_http = rr.http_status and rr.http_status < 400 and not rr.error
+            ok_valid, valid_msg = validate_output(rr.output, vmode, pattern, required_keys)
             ok = "1" if (ok_http and ok_valid) else "0"
-            f.write(
-                f"{r.run_id},{r.prompt_id},{r.output_sha256},{r.http_status},{r.ttft_s:.6f},{r.latency_s:.6f},{ok},{valid_msg}\n"
-            )
+            f.write(f"{rr.run_id},{rr.prompt_id},{rr.output_sha256},{rr.http_status},{rr.ttft_s:.6f},{rr.latency_s:.6f},{ok},{valid_msg}\n")
 
     if failures:
         print("\nFAIL")
-        for x in failures[:50]:
+        for x in failures[:80]:
             print(x)
-        if len(failures) > 50:
-            print("more_failures", len(failures) - 50)
+        if len(failures) > 80:
+            print("more_failures", len(failures) - 80)
         return 1
 
     print("\nPASS")
@@ -349,23 +337,21 @@ def main() -> int:
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--top_p", type=float, default=1.0)
     ap.add_argument("--top_k", type=int, default=40)
-    ap.add_argument("--max_tokens", type=int, default=64)
+    ap.add_argument("--max_tokens", type=int, default=16)
 
     ap.add_argument("--seed_mode", choices=["fixed", "per_prompt", "random"], default="fixed")
     ap.add_argument("--seed", type=int, default=1)
 
-    ap.add_argument("--stop", default="")
+    ap.add_argument("--stop", default="\n")
 
-    ap.add_argument("--normalize", choices=["exact", "strip", "collapse_ws", "json_canonical"], default="strip")
+    ap.add_argument("--normalize", choices=["exact", "strip", "collapse_ws", "lower_strip", "json_canonical"], default="lower_strip")
     ap.add_argument("--validator", default="single_letter_abcd")
     ap.add_argument("--validator_mode", choices=["none", "regex", "json_keys"], default="none")
     ap.add_argument("--validator_pattern", default="")
     ap.add_argument("--validator_required_keys", default="")
-    ap.add_argument("--print_diffs", action="store_true")
 
     args = ap.parse_args()
-    rc = asyncio.run(run_determinism_checks(args))
-    return rc
+    return asyncio.run(run_checks(args))
 
 
 if __name__ == "__main__":
